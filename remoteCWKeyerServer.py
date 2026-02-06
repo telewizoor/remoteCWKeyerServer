@@ -26,6 +26,15 @@ except ImportError:
     GPIO_AVAILABLE = False
     print("Warning: RPi.GPIO not available. GPIO keying will be simulated.")
 
+# Try to import serial library for COM port DTR control
+try:
+    import serial
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
+    print("Warning: pyserial not available. COM port keying will be simulated.")
+    print("Install with: pip install pyserial")
+
 # Protocol Constants
 CWNET_MAX_CLIENTS = 3
 CW_KEYING_FIFO_SIZE = 128
@@ -351,16 +360,164 @@ class GPIOKeyer:
                 pass
 
 
+class SerialKeyer:
+    """
+    Serial port DTR/RTS-based CW keying interface
+    
+    Controls CW keying via DTR (Data Terminal Ready) and/or RTS (Request To Send)
+    pins on a COM/serial port. This is a common method for keying radios,
+    especially with USB-to-Serial adapters.
+    
+    Typical usage:
+    - DTR pin: CW Key (carrier on/off)
+    - RTS pin: PTT (push-to-talk)
+    
+    Or for simple interfaces:
+    - DTR: Key
+    - RTS: not used (set to None)
+    """
+    
+    def __init__(self, port: str, key_signal: str = 'dtr', ptt_signal: Optional[str] = 'rts',
+                 invert_key: bool = False, invert_ptt: bool = False):
+        """
+        Initialize serial port keyer
+        
+        Args:
+            port: Serial port name (e.g., 'COM3' on Windows, '/dev/ttyUSB0' on Linux)
+            key_signal: Which signal to use for key ('dtr' or 'rts')
+            ptt_signal: Which signal to use for PTT ('dtr', 'rts', or None to disable)
+            invert_key: Invert key signal (False=high for key down, True=low for key down)
+            invert_ptt: Invert PTT signal
+        """
+        self.port = port
+        self.key_signal = key_signal.lower()
+        self.ptt_signal = ptt_signal.lower() if ptt_signal else None
+        self.invert_key = invert_key
+        self.invert_ptt = invert_ptt
+        self.serial_port = None
+        self.serial_initialized = False
+        self.key_state = False
+        self.ptt_state = False
+        
+        if not SERIAL_AVAILABLE:
+            print(f"Serial keyer: pyserial not available - running in SIMULATION mode")
+            return
+        
+        try:
+            # Open serial port
+            # We don't need to send/receive data, just control DTR/RTS
+            self.serial_port = serial.Serial(
+                port=port,
+                baudrate=9600,  # Doesn't matter for DTR/RTS control
+                timeout=0
+            )
+            
+            # Initialize signals to OFF state
+            self._set_signal(self.key_signal, False)
+            if self.ptt_signal:
+                self._set_signal(self.ptt_signal, False)
+            
+            self.serial_initialized = True
+            ptt_info = f", PTT={self.ptt_signal.upper()}" if self.ptt_signal else ""
+            print(f"Serial keyer initialized: {port} (KEY={self.key_signal.upper()}{ptt_info})")
+            
+        except Exception as e:
+            print(f"Failed to initialize serial port {port}: {e}")
+            self.serial_initialized = False
+    
+    def _set_signal(self, signal: str, state: bool):
+        """
+        Set DTR or RTS signal state
+        
+        Args:
+            signal: 'dtr' or 'rts'
+            state: True for high, False for low
+        """
+        if not self.serial_port:
+            return
+        
+        try:
+            if signal == 'dtr':
+                self.serial_port.dtr = state
+            elif signal == 'rts':
+                self.serial_port.rts = state
+        except Exception as e:
+            print(f"Error setting {signal.upper()}: {e}")
+    
+    def set_key_state(self, key_down: bool):
+        """
+        Set the CW key state
+        
+        Args:
+            key_down: True for key down (carrier ON), False for key up
+        """
+        self.key_state = key_down
+        
+        # Apply inversion if needed
+        signal_state = (not key_down) if self.invert_key else key_down
+        
+        if self.serial_initialized:
+            self._set_signal(self.key_signal, signal_state)
+        
+        state_str = "DOWN (TX ON)" if key_down else "UP (TX OFF)"
+        signal_str = "HIGH" if signal_state else "LOW"
+        print(f"[SERIAL] Key {state_str} ({self.key_signal.upper()}={signal_str})")
+    
+    def set_ptt_state(self, ptt_on: bool):
+        """
+        Set the PTT (Push-To-Talk) state
+        
+        Args:
+            ptt_on: True for PTT on, False for PTT off
+        """
+        if not self.ptt_signal:
+            return
+        
+        self.ptt_state = ptt_on
+        
+        # Apply inversion if needed
+        signal_state = (not ptt_on) if self.invert_ptt else ptt_on
+        
+        if self.serial_initialized:
+            self._set_signal(self.ptt_signal, signal_state)
+        
+        state_str = "ON" if ptt_on else "OFF"
+        signal_str = "HIGH" if signal_state else "LOW"
+        print(f"[SERIAL] PTT {state_str} ({self.ptt_signal.upper()}={signal_str})")
+    
+    def cleanup(self):
+        """Cleanup serial port resources"""
+        if self.serial_port:
+            try:
+                # Set both signals low before closing
+                self._set_signal(self.key_signal, False)
+                if self.ptt_signal:
+                    self._set_signal(self.ptt_signal, False)
+                
+                self.serial_port.close()
+                print(f"Serial port {self.port} closed")
+            except:
+                pass
+
+
 class CwKeyerThread:
     """
     Thread that plays back CW keying patterns from the FIFO
     
     This implements the intelligent latency control and timing from
     the original KeyerThread() in the C implementation.
+    
+    Works with both GPIOKeyer and SerialKeyer.
     """
     
-    def __init__(self, gpio_keyer: GPIOKeyer):
-        self.gpio_keyer = gpio_keyer
+    def __init__(self, keyer):
+        """
+        Initialize keyer thread
+        
+        Args:
+            keyer: Either GPIOKeyer or SerialKeyer instance
+        """
+        self.keyer = keyer
         self.rx_fifo = CwKeyingFifo()
         self.running = False
         self.thread: Optional[threading.Thread] = None
@@ -409,7 +566,7 @@ class CwKeyerThread:
                         
                         # Apply the new key state
                         self.current_key_state = key_down
-                        self.gpio_keyer.set_key_state(key_down)
+                        self.keyer.set_key_state(key_down)
                         
                         # Schedule next transition
                         self.next_transition_time_ms = current_time_ms + wait_ms
@@ -417,7 +574,7 @@ class CwKeyerThread:
                         # FIFO empty - ensure key is up
                         if self.current_key_state:
                             self.current_key_state = False
-                            self.gpio_keyer.set_key_state(False)
+                            self.keyer.set_key_state(False)
                 
                 # Sleep for 1ms (high precision timing)
                 time.sleep(0.001)
@@ -507,11 +664,40 @@ class CwNetClient:
 
 
 class CwNetServer:
-    """Enhanced CW Network Server with Morse decoding and GPIO support"""
+    """Enhanced CW Network Server with Morse decoding and GPIO/Serial support"""
     
     def __init__(self, host: str = '0.0.0.0', port: int = 7355,
+                 # GPIO options
                  gpio_key_pin: int = 17, gpio_ptt_pin: Optional[int] = 27,
-                 enable_gpio: bool = True):
+                 enable_gpio: bool = False,
+                 # Serial port options
+                 serial_port: Optional[str] = None,
+                 serial_key_signal: str = 'dtr',
+                 serial_ptt_signal: Optional[str] = 'rts',
+                 serial_invert_key: bool = False,
+                 serial_invert_ptt: bool = False):
+        """
+        Initialize CW Network Server
+        
+        Args:
+            host: Bind address
+            port: Listen port
+            
+            GPIO mode options:
+            gpio_key_pin: GPIO pin for KEY (default 17)
+            gpio_ptt_pin: GPIO pin for PTT (default 27)
+            enable_gpio: Enable GPIO mode (default False)
+            
+            Serial port mode options:
+            serial_port: COM port name (e.g., 'COM3' or '/dev/ttyUSB0')
+            serial_key_signal: Signal for KEY ('dtr' or 'rts', default 'dtr')
+            serial_ptt_signal: Signal for PTT ('dtr', 'rts', or None, default 'rts')
+            serial_invert_key: Invert KEY signal polarity
+            serial_invert_ptt: Invert PTT signal polarity
+            
+        Note: GPIO and Serial port are mutually exclusive.
+              If both are specified, Serial port takes priority.
+        """
         self.host = host
         self.port = port
         self.server_socket: Optional[socket.socket] = None
@@ -532,14 +718,30 @@ class CwNetServer:
         self.operation_mode = 1  # CW mode
         self.s_meter = -120
         
-        # GPIO keyer
-        self.enable_gpio = enable_gpio
-        if enable_gpio:
-            self.gpio_keyer = GPIOKeyer(gpio_key_pin, gpio_ptt_pin)
-            self.keyer_thread = CwKeyerThread(self.gpio_keyer)
+        # Keyer initialization - Serial port takes priority over GPIO
+        self.keyer = None
+        self.keyer_thread = None
+        
+        if serial_port:
+            # Serial port mode
+            print(f"Initializing Serial keyer on {serial_port}...")
+            self.keyer = SerialKeyer(
+                port=serial_port,
+                key_signal=serial_key_signal,
+                ptt_signal=serial_ptt_signal,
+                invert_key=serial_invert_key,
+                invert_ptt=serial_invert_ptt
+            )
+            if self.keyer.serial_initialized:
+                self.keyer_thread = CwKeyerThread(self.keyer)
+        elif enable_gpio:
+            # GPIO mode
+            print(f"Initializing GPIO keyer...")
+            self.keyer = GPIOKeyer(gpio_key_pin, gpio_ptt_pin)
+            if self.keyer.gpio_initialized:
+                self.keyer_thread = CwKeyerThread(self.keyer)
         else:
-            self.gpio_keyer = None
-            self.keyer_thread = None
+            print("Running in SIMULATION mode (no hardware keying)")
         
         # Current transmitting client (-1 = none)
         self.transmitting_client_index = -1
@@ -580,9 +782,9 @@ class CwNetServer:
         if self.keyer_thread:
             self.keyer_thread.stop()
         
-        # Cleanup GPIO
-        if self.gpio_keyer:
-            self.gpio_keyer.cleanup()
+        # Cleanup keyer (GPIO or Serial)
+        if self.keyer:
+            self.keyer.cleanup()
         
         # Close all client connections
         for client in self.clients:
@@ -864,11 +1066,10 @@ class CwNetServer:
             client.last_ping_time = current_time
         
         # Send VFO report every 0.5 seconds
-        # if current_time - client.last_vfo_report_time > 0.5:
-        #     vfo_report = VfoReport(self.vfo_frequency, 0, self.s_meter)
-        #     self._send_command(client, CwNetCmd.FREQ_REPORT, vfo_report.pack())
-        #     print(vfo_report.pack())
-        #     client.last_vfo_report_time = current_time
+        if current_time - client.last_vfo_report_time > 0.5:
+            vfo_report = VfoReport(self.vfo_frequency, 0, self.s_meter)
+            self._send_command(client, CwNetCmd.FREQ_REPORT, vfo_report.pack())
+            client.last_vfo_report_time = current_time
     
     def _disconnect_client(self, client: CwNetClient):
         """Disconnect a client"""
@@ -882,26 +1083,68 @@ def main():
     """Main function"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='CW Network Server with GPIO Keying')
+    parser = argparse.ArgumentParser(description='CW Network Server with GPIO/Serial Keying')
     parser.add_argument('--host', default='0.0.0.0', help='Bind address (default: 0.0.0.0)')
     parser.add_argument('--port', type=int, default=7355, help='Port number (default: 7355)')
-    parser.add_argument('--key-pin', type=int, default=17, help='GPIO pin for CW key (default: 17)')
-    parser.add_argument('--ptt-pin', type=int, default=27, help='GPIO pin for PTT (default: 27)')
-    parser.add_argument('--no-gpio', action='store_true', help='Disable GPIO (simulation mode)')
+    
+    # Keying mode selection
+    keying_mode = parser.add_mutually_exclusive_group()
+    keying_mode.add_argument('--gpio', action='store_true', help='Use GPIO keying (Raspberry Pi)')
+    keying_mode.add_argument('--serial', type=str, metavar='PORT', help='Use serial port keying (e.g., COM3, /dev/ttyUSB0)')
+    
+    # GPIO options
+    gpio_group = parser.add_argument_group('GPIO options (when --gpio is used)')
+    gpio_group.add_argument('--key-pin', type=int, default=17, help='GPIO pin for CW key (default: 17)')
+    gpio_group.add_argument('--ptt-pin', type=int, default=27, help='GPIO pin for PTT (default: 27)')
+    
+    # Serial port options
+    serial_group = parser.add_argument_group('Serial port options (when --serial is used)')
+    serial_group.add_argument('--key-signal', choices=['dtr', 'rts'], default='dtr',
+                              help='Signal for KEY (default: dtr)')
+    serial_group.add_argument('--ptt-signal', choices=['dtr', 'rts', 'none'], default='rts',
+                              help='Signal for PTT (default: rts, use "none" to disable)')
+    serial_group.add_argument('--invert-key', action='store_true',
+                              help='Invert KEY signal (low=key down)')
+    serial_group.add_argument('--invert-ptt', action='store_true',
+                              help='Invert PTT signal (low=ptt on)')
     
     args = parser.parse_args()
     
+    # Determine keying mode
+    enable_gpio = args.gpio
+    serial_port = args.serial
+    serial_ptt_signal = None if args.ptt_signal == 'none' else args.ptt_signal
+    
+    # Create server
     server = CwNetServer(
         host=args.host,
         port=args.port,
+        # GPIO options
         gpio_key_pin=args.key_pin,
         gpio_ptt_pin=args.ptt_pin,
-        enable_gpio=not args.no_gpio
+        enable_gpio=enable_gpio,
+        # Serial port options
+        serial_port=serial_port,
+        serial_key_signal=args.key_signal,
+        serial_ptt_signal=serial_ptt_signal,
+        serial_invert_key=args.invert_key,
+        serial_invert_ptt=args.invert_ptt
     )
     
     if server.start():
         print("Server running. Press Ctrl+C to stop.")
-        print(f"GPIO mode: {'ENABLED' if not args.no_gpio else 'SIMULATION'}")
+        
+        # Show keying mode
+        if serial_port:
+            print(f"Keying mode: SERIAL PORT ({serial_port})")
+            print(f"  KEY signal: {args.key_signal.upper()}{' (inverted)' if args.invert_key else ''}")
+            if serial_ptt_signal:
+                print(f"  PTT signal: {serial_ptt_signal.upper()}{' (inverted)' if args.invert_ptt else ''}")
+        elif enable_gpio:
+            print(f"Keying mode: GPIO (KEY={args.key_pin}, PTT={args.ptt_pin})")
+        else:
+            print("Keying mode: SIMULATION (no hardware)")
+        
         try:
             while True:
                 time.sleep(1)
