@@ -523,6 +523,8 @@ class CwKeyerThread:
         self.thread: Optional[threading.Thread] = None
         self.current_key_state = False
         self.next_transition_time_ms = 0
+        self.pending_state = False
+        self.state_change_pending = False
         
     def start(self):
         """Start the keyer thread"""
@@ -551,36 +553,53 @@ class CwKeyerThread:
             self.rx_fifo.push(byte_val, current_time_ms)
     
     def _keyer_loop(self):
-        """Main keyer loop - runs in separate thread"""
+        """
+        Main keyer loop - runs in separate thread
+        
+        CW Stream format - RELATIVE timing:
+        Each byte contains:
+        - Bit 7: Key state (1=down, 0=up)  
+        - Bits 6-0: Time in ms SINCE PREVIOUS EVENT
+        """
+        
         while self.running:
             try:
                 current_time_ms = int(time.time() * 1000)
                 
-                # Check if we need to transition to a new state
-                if current_time_ms >= self.next_transition_time_ms:
-                    # Get next event from FIFO
+                # Check if we have a pending state change to apply
+                if self.state_change_pending:
+                    if current_time_ms >= self.next_transition_time_ms:
+                        # Apply the state change
+                        self.current_key_state = self.pending_state
+                        self.keyer.set_key_state(self.pending_state)
+                        self.state_change_pending = False
+                        # Don't process next event yet - wait one loop iteration
+                
+                # If no pending change, try to get next event from FIFO
+                elif not self.state_change_pending:
                     elem = self.rx_fifo.pop()
                     
                     if elem:
-                        key_down, wait_ms = CwStreamEncoder.decode_key_event(elem.cmd)
+                        new_state, delay_ms = CwStreamEncoder.decode_key_event(elem.cmd)
                         
-                        # Apply the new key state
-                        self.current_key_state = key_down
-                        self.keyer.set_key_state(key_down)
+                        # Schedule when to apply this state
+                        self.next_transition_time_ms = current_time_ms + delay_ms
+                        self.pending_state = new_state
+                        self.state_change_pending = True
                         
-                        # Schedule next transition
-                        self.next_transition_time_ms = current_time_ms + wait_ms
                     else:
                         # FIFO empty - ensure key is up
                         if self.current_key_state:
                             self.current_key_state = False
                             self.keyer.set_key_state(False)
                 
-                # Sleep for 1ms (high precision timing)
+                # Sleep for 1ms
                 time.sleep(0.001)
                 
             except Exception as e:
                 print(f"Error in keyer loop: {e}")
+                import traceback
+                traceback.print_exc()
                 time.sleep(0.01)
 
 
@@ -706,11 +725,11 @@ class CwNetServer:
         self.accept_thread: Optional[threading.Thread] = None
         self.poll_thread: Optional[threading.Thread] = None
         
-        # Server configuration
+        # Server configuration - everyone has full permissions
         self.accept_users = {
             "Max": 7,
             "Moritz": 7,
-            "Guest": 1
+            "Guest": 7
         }
         
         # Radio parameters (simulated)
@@ -978,18 +997,13 @@ class CwNetServer:
         """
         print(f"[MORSE] Received {len(payload)} bytes from {client.address} ({client.user_name})")
         
-        # Check if this client has permission to transmit
-        if not (client.permissions & 0x02):  # Bit 1 = TX permission
-            print(f"[MORSE] Client {client.user_name} doesn't have TX permission")
-            return
-        
         # Decode and log the Morse events
         for byte_val in payload:
             key_down, wait_ms = CwStreamEncoder.decode_key_event(byte_val)
             state_str = "DOWN" if key_down else "UP"
             print(f"[MORSE]   Key {state_str} after {wait_ms}ms")
         
-        # Send to GPIO keyer
+        # Send to keyer
         if self.keyer_thread:
             self.keyer_thread.add_morse_data(payload)
             client.is_transmitting = True
