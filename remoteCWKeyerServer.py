@@ -584,20 +584,21 @@ class CwKeyerThread:
                 # If no pending change, try to get next event from FIFO
                 elif not self.state_change_pending:
                     elem = self.rx_fifo.pop()
-                    
+
                     if elem:
                         new_state, delay_ms = CwStreamEncoder.decode_key_event(elem.cmd)
-                        
-                        # Schedule when to apply this state
+
                         self.next_transition_time_ms = current_time_ms + delay_ms
                         self.pending_state = new_state
                         self.state_change_pending = True
-                        
+
                     else:
-                        # FIFO empty - ensure key is up
-                        if self.current_key_state:
-                            self.current_key_state = False
-                            self.keyer.set_key_state(False)
+                        # FIFO empty – only drop key if EOT detected
+                        if self.rx_fifo.check_for_end_of_transmission():
+                            if self.current_key_state:
+                                self.current_key_state = False
+                                self.keyer.set_key_state(False)
+
                 
                 # Sleep for 1ms
                 time.sleep(0.001)
