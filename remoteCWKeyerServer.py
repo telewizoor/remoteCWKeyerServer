@@ -441,6 +441,12 @@ class SerialKeyer:
                 self.serial_port.dtr = state
             elif signal == 'rts':
                 self.serial_port.rts = state
+            
+            # CRITICAL: Add small delay to prevent USB adapter crash
+            # Some cheap USB-Serial adapters (especially PL2303) can't handle
+            # rapid DTR/RTS changes and will hang with error -32 (EPIPE)
+            time.sleep(0.002)  # 2ms delay between operations
+            
         except Exception as e:
             print(f"Error setting {signal.upper()}: {e}")
     
