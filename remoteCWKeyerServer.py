@@ -506,6 +506,109 @@ class SerialKeyer:
                 pass
 
 
+class SimKeyer:
+    """Simulation keyer to allow decoding without hardware."""
+
+    def __init__(self):
+        self.key_state = False
+        self.ptt_state = False
+
+    def set_key_state(self, key_down: bool):
+        self.key_state = key_down
+
+    def set_ptt_state(self, ptt_on: bool):
+        self.ptt_state = ptt_on
+
+    def cleanup(self):
+        pass
+
+
+class MorseCodeLogger:
+    """Decode dot/dash from key output transitions and estimate WPM."""
+
+    def __init__(self, dot_ms: int = 60, letter_gap_dots: float = 2.2, word_gap_dots: float = 6.0):
+        self.dot_ms = dot_ms
+        self.letter_gap_dots = letter_gap_dots
+        self.word_gap_dots = word_gap_dots
+        self.current_symbol = ""
+        self.last_state = None
+        self.last_transition_time_ms = None
+        self.last_wpm_printed = None
+        self.dot_history = deque(maxlen=8)
+        self.morse_table = self._build_morse_table()
+
+    def _build_morse_table(self) -> dict:
+        # International Morse (letters, digits, common punctuation)
+        return {
+            ".-": "A", "-...": "B", "-.-.": "C", "-..": "D", ".": "E",
+            "..-.": "F", "--.": "G", "....": "H", "..": "I", ".---": "J",
+            "-.-": "K", ".-..": "L", "--": "M", "-.": "N", "---": "O",
+            ".--.": "P", "--.-": "Q", ".-.": "R", "...": "S", "-": "T",
+            "..-": "U", "...-": "V", ".--": "W", "-..-": "X", "-.--": "Y",
+            "--..": "Z",
+            "-----": "0", ".----": "1", "..---": "2", "...--": "3", "....-": "4",
+            ".....": "5", "-....": "6", "--...": "7", "---..": "8", "----.": "9",
+            ".-.-.-": ".", "--..--": ",", "..--..": "?", ".----.": "'",
+            "-.-.--": "!", "-..-.": "/", "-.--.": "(", "-.--.-": ")",
+            ".-...": "&", "---...": ":", "-.-.-.": ";", "-...-": "=",
+            ".-.-.": "+", "-....-": "-", "..--.-": "_", ".-..-.": "\"",
+            "...-..-": "$", ".--.-.": "@",
+        }
+
+    def on_transition(self, new_state: bool, now_ms: int) -> None:
+        if self.last_transition_time_ms is None:
+            self.last_transition_time_ms = now_ms
+            self.last_state = new_state
+            return
+
+        duration_ms = now_ms - self.last_transition_time_ms
+
+        if self.last_state:
+            # Key was down -> dot/dash length
+            if duration_ms < self.dot_ms * 2:
+                self.current_symbol += '.'
+                self._update_dot_ms(duration_ms)
+            else:
+                self.current_symbol += '-'
+        else:
+            # Key was up -> gaps between elements/letters/words
+            if self.current_symbol:
+                if duration_ms >= self.dot_ms * self.word_gap_dots:
+                    self._emit_symbol(word_gap=True)
+                elif duration_ms >= self.dot_ms * self.letter_gap_dots:
+                    self._emit_symbol(word_gap=False)
+
+        self.last_transition_time_ms = now_ms
+        self.last_state = new_state
+
+    def _emit_symbol(self, word_gap: bool) -> None:
+        if not self.current_symbol:
+            return
+
+        wpm = int(round(1200 / max(self.dot_ms, 1)))
+        if self.last_wpm_printed is None or abs(wpm - self.last_wpm_printed) >= 2:
+            print(f"WPM {wpm}")
+            self.last_wpm_printed = wpm
+
+        decoded = self.morse_table.get(self.current_symbol, "?")
+        print(decoded, end="", flush=True)
+        if word_gap:
+            print(" ", end="", flush=True)
+        self.current_symbol = ""
+
+    def _update_dot_ms(self, duration_ms: int) -> None:
+        self.dot_history.append(duration_ms)
+        values = sorted(self.dot_history)
+        if not values:
+            return
+        mid = len(values) // 2
+        if len(values) % 2 == 1:
+            median = values[mid]
+        else:
+            median = int(round((values[mid - 1] + values[mid]) / 2))
+        self.dot_ms = median
+
+
 class CwKeyerThread:
     """
     Thread that plays back CW keying patterns from the FIFO
@@ -531,6 +634,8 @@ class CwKeyerThread:
         self.next_transition_time_ms = 0
         self.pending_state = False
         self.state_change_pending = False
+        self.last_transition_time_ms = int(time.time() * 1000)
+        self.morse_logger = MorseCodeLogger()
         
     def start(self):
         """Start the keyer thread"""
@@ -578,6 +683,8 @@ class CwKeyerThread:
                         # Apply the state change
                         self.current_key_state = self.pending_state
                         self.keyer.set_key_state(self.pending_state)
+                        self.last_transition_time_ms = current_time_ms
+                        self.morse_logger.on_transition(self.pending_state, current_time_ms)
                         self.state_change_pending = False
                         # Don't process next event yet - wait one loop iteration
                 
@@ -588,7 +695,10 @@ class CwKeyerThread:
                     if elem:
                         new_state, delay_ms = CwStreamEncoder.decode_key_event(elem.cmd)
 
-                        self.next_transition_time_ms = current_time_ms + delay_ms
+                        target_time_ms = self.last_transition_time_ms + delay_ms
+                        if target_time_ms < current_time_ms:
+                            target_time_ms = current_time_ms
+                        self.next_transition_time_ms = target_time_ms
                         self.pending_state = new_state
                         self.state_change_pending = True
 
@@ -768,6 +878,8 @@ class CwNetServer:
                 self.keyer_thread = CwKeyerThread(self.keyer)
         else:
             print("Running in SIMULATION mode (no hardware keying)")
+            self.keyer = SimKeyer()
+            self.keyer_thread = CwKeyerThread(self.keyer)
         
         # Current transmitting client (-1 = none)
         self.transmitting_client_index = -1
@@ -993,7 +1105,7 @@ class CwNetServer:
                 self._send_command(client, CwNetCmd.PING, response)
             elif req_resp == 1:
                 latency_ms = (t2 - t1) if t2 > t1 else 0
-                print(f"Ping response from {client.address}: latency ~{latency_ms}ms")
+                _ = latency_ms
     
     def _handle_morse(self, client: CwNetClient, payload: bytes):
         """
@@ -1002,13 +1114,7 @@ class CwNetServer:
         This is where the received CW keying patterns are processed
         and sent to the GPIO keyer for actual transmission.
         """
-        print(f"[MORSE] Received {len(payload)} bytes from {client.address} ({client.user_name})")
-        
-        # Decode and log the Morse events
-        for byte_val in payload:
-            key_down, wait_ms = CwStreamEncoder.decode_key_event(byte_val)
-            state_str = "DOWN" if key_down else "UP"
-            print(f"[MORSE]   Key {state_str} after {wait_ms}ms")
+        _ = payload
         
         # Send to keyer
         if self.keyer_thread:
@@ -1030,7 +1136,7 @@ class CwNetServer:
         """Handle rigctld command"""
         try:
             cmd_str = payload.decode('utf-8', errors='ignore').strip()
-            print(f"[RIGCTLD] Command from {client.address}: {cmd_str}")
+            # Rigctld logs hidden by default
             
             if cmd_str.startswith('f') or cmd_str.startswith('get_freq'):
                 response = f"{int(self.vfo_frequency)}\n"
